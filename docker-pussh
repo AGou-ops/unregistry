@@ -74,6 +74,7 @@ usage() {
     echo "Options:"
     echo "  -h, --help                Show this help message."
     echo "  -i, --ssh-key path        Path to SSH private key for remote login (if not already added to SSH agent)."
+    echo "  -c, --runtime-cmd string  Remote runtime command to use: docker or ctr (default: docker)."
     echo "      --no-host-key-check   Skip SSH host key checking (use with caution)."
     echo "      --platform string     Push a specific platform for a multi-platform image (e.g., linux/amd64, linux/arm64)."
     echo "                            Local Docker has to use containerd image store to support multi-platform images."
@@ -87,6 +88,7 @@ usage() {
     echo "  docker pussh myimage:latest user@host"
     echo "  docker pussh --platform linux/amd64 myimage host"
     echo "  docker pussh myimage:1.2.3 user@host:2222 -i ~/.ssh/id_ed25519"
+    echo "  docker pussh -c ctr myimage:1.2.3 user@host"
     echo ""
     echo "  # Set custom docker binary path and containerd socket on remote host:"
     echo "  REMOTE_DOCKER_PATH=/usr/local/bin/docker REMOTE_CONTAINERD_SOCKET=/var/run/docker/containerd/containerd.sock \\"
@@ -202,6 +204,30 @@ check_remote_docker() {
     fi
 }
 
+# Check if the remote host has containerd installed and if we can run ctr commands.
+# If sudo is required, it sets the REMOTE_SUDO variable to "sudo -n".
+check_remote_ctr() {
+    # Check if ctr command is available.
+    # shellcheck disable=SC2029
+    if ! ssh "${SSH_ARGS[@]}" "command -v ctr" >/dev/null 2>&1; then
+        error "'ctr' command not found on remote host. Please ensure containerd is installed."
+    fi
+    # Check if we need sudo to run ctr commands.
+    # shellcheck disable=SC2029
+    if ! ssh "${SSH_ARGS[@]}" "ctr version" >/dev/null 2>&1; then
+        # Check if we're not root and if sudo ctr works.
+        # shellcheck disable=SC2029
+        if ssh "${SSH_ARGS[@]}" "[ \$(id -u) -ne 0 ] && sudo -n ctr version" >/dev/null; then
+            REMOTE_SUDO="sudo -n"
+        else
+            error "Failed to run ctr commands on remote host. Please ensure:
+  - containerd is installed and running on the remote host
+  - SSH user has permissions to run ctr commands (user is root or has access to containerd)
+  - If sudo is required, ensure the user can run 'sudo ctr' without a password prompt"
+        fi
+    fi
+}
+
 # Generate a random port in range 55000-65535.
 random_port() {
     echo $((55000 + RANDOM % 10536))
@@ -285,6 +311,40 @@ run_unregistry() {
     error "Failed to start unregistry container:\n${output}"
 }
 
+# Run unregistry container on remote host via ctr.
+# Sets UNREGISTRY_PORT and UNREGISTRY_CONTAINER global variables.
+run_unregistry_ctr() {
+    local output
+
+    # Find containerd socket first
+    find_containerd_socket
+
+    # Pull unregistry image if it doesn't exist on the remote host. This is done separately to not capture the output
+    # and print the pull progress to the terminal.
+    # shellcheck disable=SC2029
+    if ! ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ctr images inspect ${UNREGISTRY_IMAGE}" >/dev/null 2>&1; then
+        ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ctr images pull ${UNREGISTRY_IMAGE}"
+    fi
+
+    UNREGISTRY_PORT="5000"
+    UNREGISTRY_CONTAINER="unregistry-pussh-$$"
+
+    # shellcheck disable=SC2029
+    if ! output=$(ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ctr run --detach \
+        --net-host \
+        --mount type=bind,src=${REMOTE_CONTAINERD_SOCKET},dst=/run/containerd/containerd.sock,options=rbind \
+        --env UNREGISTRY_CONTAINERD_NAMESPACE=k8s.io \
+        ${UNREGISTRY_IMAGE} \
+        ${UNREGISTRY_CONTAINER}" 2>&1);
+    then
+        # Check if the error is due to port binding.
+        if ! echo "${output}" | grep -q --ignore-case "bind.*${UNREGISTRY_PORT}"; then
+            error "Failed to start unregistry container:\n${output}"
+        fi
+        error "Failed to start unregistry container:\n${output}"
+    fi
+}
+
 # Forward a local port to a remote port over the established SSH connection.
 # Returns the local port that was successfully bound.
 forward_port() {
@@ -357,6 +417,7 @@ run_docker_desktop_tunnel() {
 }
 
 DOCKER_PLATFORM=""
+RUNTIME_CMD="docker"
 SSH_KEY=""
 IMAGE=""
 SSH_ADDRESS=""
@@ -375,6 +436,20 @@ while [[ $# -gt 0 ]]; do
                 error "-i/--ssh-key option requires an argument.\n${help_command}"
             fi
             SSH_KEY="$2"
+            shift 2
+            ;;
+        -c|--runtime-cmd)
+            if [[ -z "${2:-}" ]]; then
+                error "-c/--runtime-cmd option requires an argument.\n${help_command}"
+            fi
+            case "$2" in
+                docker|ctr)
+                    RUNTIME_CMD="$2"
+                    ;;
+                *)
+                    error "Invalid runtime command: $2 (expected: docker or ctr).\n${help_command}"
+                    ;;
+            esac
             shift 2
             ;;
         --no-host-key-check)
@@ -459,8 +534,15 @@ cleanup() {
 
     # Stop and remove unregistry container on remote host.
     if [[ -n "${UNREGISTRY_CONTAINER}" ]]; then
-        # shellcheck disable=SC2029
-        ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ${REMOTE_DOCKER_PATH} rm -f ${UNREGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+        if [[ "${RUNTIME_CMD}" == "ctr" ]]; then
+            # shellcheck disable=SC2029
+            ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ctr tasks kill -s SIGKILL ${UNREGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+            # shellcheck disable=SC2029
+            ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ctr containers delete ${UNREGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+        else
+            # shellcheck disable=SC2029
+            ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ${REMOTE_DOCKER_PATH} rm -f ${UNREGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+        fi
     fi
 
     # Terminate the shared SSH connection if it was established.
@@ -472,10 +554,18 @@ trap cleanup EXIT
 
 info "Connecting to ${SSH_ADDRESS}..."
 ssh_remote "${SSH_ADDRESS}"
-check_remote_docker
+if [[ "${RUNTIME_CMD}" == "ctr" ]]; then
+    check_remote_ctr
+else
+    check_remote_docker
+fi
 
 info "Starting unregistry container on remote host..."
-run_unregistry
+if [[ "${RUNTIME_CMD}" == "ctr" ]]; then
+    run_unregistry_ctr
+else
+    run_unregistry
+fi
 success "Unregistry is listening localhost:${UNREGISTRY_PORT} on remote host."
 
 # Forward random local port to remote unregistry port through established SSH connection.
@@ -493,6 +583,9 @@ if is_additional_tunneling_needed; then
 fi
 
 REMOTE_IMAGE=$(normalise_registry_port "${IMAGE}")
+if [[ "${RUNTIME_CMD}" == "ctr" ]]; then
+    REMOTE_IMAGE="${IMAGE}"
+fi
 # Tag and push the image to unregistry through the forwarded port.
 REGISTRY_IMAGE="localhost:${PUSH_PORT}/${REMOTE_IMAGE}"
 docker tag "${IMAGE}" "${REGISTRY_IMAGE}"
@@ -526,23 +619,25 @@ if [[ "${PUSH_SUCCESS}" = false ]]; then
 fi
 
 REMOTE_RETAG_IMAGE=""
-if [[ "${REMOTE_IMAGE}" != "${IMAGE}" ]]; then
+if [[ "${RUNTIME_CMD}" == "docker" && "${REMOTE_IMAGE}" != "${IMAGE}" ]]; then
     REMOTE_RETAG_IMAGE="${REMOTE_IMAGE}"
 fi
 
 # Pull image from unregistry if remote Docker doesn't use containerd image store.
 # shellcheck disable=SC2029
-if ! ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ${REMOTE_DOCKER_PATH} info -f '{{ .DriverStatus }}' | grep -q 'containerd.snapshotter'"; then
-    info "Remote Docker doesn't use containerd image store. Pulling image from unregistry..."
-    REMOTE_REGISTRY_IMAGE="localhost:${UNREGISTRY_PORT}/${REMOTE_IMAGE}"
-    if ! ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ${REMOTE_DOCKER_PATH}  pull ${REMOTE_REGISTRY_IMAGE}"; then
-        error "Failed to pull image from unregistry on remote host."
+if [[ "${RUNTIME_CMD}" == "docker" ]]; then
+    if ! ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ${REMOTE_DOCKER_PATH} info -f '{{ .DriverStatus }}' | grep -q 'containerd.snapshotter'"; then
+        info "Remote Docker doesn't use containerd image store. Pulling image from unregistry..."
+        REMOTE_REGISTRY_IMAGE="localhost:${UNREGISTRY_PORT}/${REMOTE_IMAGE}"
+        if ! ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ${REMOTE_DOCKER_PATH}  pull ${REMOTE_REGISTRY_IMAGE}"; then
+            error "Failed to pull image from unregistry on remote host."
+        fi
+        REMOTE_RETAG_IMAGE="${REMOTE_REGISTRY_IMAGE}"
     fi
-    REMOTE_RETAG_IMAGE="${REMOTE_REGISTRY_IMAGE}"
 fi
 
 # Retag the image to the original name if needed and remove the temporary tag.
-if [[ -n "${REMOTE_RETAG_IMAGE}" ]]; then
+if [[ "${RUNTIME_CMD}" == "docker" && -n "${REMOTE_RETAG_IMAGE}" ]]; then
     # shellcheck disable=SC2029
     if ! ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ${REMOTE_DOCKER_PATH}  tag ${REMOTE_RETAG_IMAGE} ${IMAGE}"; then
         error "Failed to retag image on remote host ${REMOTE_RETAG_IMAGE} → ${IMAGE}"
@@ -553,7 +648,14 @@ if [[ -n "${REMOTE_RETAG_IMAGE}" ]]; then
 fi
 
 info "Removing unregistry container on remote host..."
-# shellcheck disable=SC2029
-ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ${REMOTE_DOCKER_PATH}  rm -f ${UNREGISTRY_CONTAINER}" >/dev/null || true
+if [[ "${RUNTIME_CMD}" == "ctr" ]]; then
+    # shellcheck disable=SC2029
+    ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ctr tasks kill -s SIGKILL ${UNREGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+    # shellcheck disable=SC2029
+    ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ctr containers delete ${UNREGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+else
+    # shellcheck disable=SC2029
+    ssh "${SSH_ARGS[@]}" "${REMOTE_SUDO} ${REMOTE_DOCKER_PATH}  rm -f ${UNREGISTRY_CONTAINER}" >/dev/null || true
+fi
 
 success "Successfully pushed ${BOLD}${IMAGE}${RST} to ${BOLD}${SSH_ADDRESS}${RST}"
