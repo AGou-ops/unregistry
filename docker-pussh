@@ -499,6 +499,18 @@ if [[ -n "${SSH_KEY}" ]] && [[ ! -f "${SSH_KEY}" ]]; then
     error "SSH key file not found: ${SSH_KEY}"
 fi
 
+# Ensure the image exists locally; try pulling if missing.
+if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    info "Image ${IMAGE} not found locally, attempting to pull..."
+    DOCKER_PULL_OPTS=()
+    if [[ -n "${DOCKER_PLATFORM:-}" ]]; then
+        DOCKER_PULL_OPTS+=("--platform" "${DOCKER_PLATFORM}")
+    fi
+    if ! docker pull ${DOCKER_PULL_OPTS[@]+"${DOCKER_PULL_OPTS[@]}"} "${IMAGE}"; then
+        error "Failed to pull image ${IMAGE}. Please ensure it exists and is accessible."
+    fi
+fi
+
 # Replace colon in the registry part of the image name with dash to make it a valid Docker image name component.
 # For example, "localhost:5000/myimage" -> "localhost-5000/myimage"
 normalise_registry_port() {
